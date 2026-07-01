@@ -1,0 +1,208 @@
+name: mlops_dbx-ci-$(Date:yyyyMMdd)$(Rev:.r)
+
+# Azure Repos PR validation is configured with a branch build-validation policy.
+# Keep this YAML triggerless so the same pipeline can also be run manually.
+trigger: none
+pr: none
+
+variables:
+  - group: databricks-cicd
+  - name: DATABRICKS_CLI_VERSION
+    value: '1.2.1'
+
+pool:
+  vmImage: ubuntu-22.04
+
+stages:
+  - stage: ci
+    displayName: CI validation
+    jobs:
+      - job: unit_tests
+        displayName: Feature and training unit tests
+        steps:
+          - checkout: self
+            clean: true
+
+          - task: UsePythonVersion@0
+            displayName: Use Python 3.10
+            inputs:
+              versionSpec: '3.10'
+
+          - task: JavaToolInstaller@0
+            displayName: Use Java 11
+            inputs:
+              versionSpec: '11'
+              jdkArchitectureOption: x64
+              jdkSourceOption: PreInstalled
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+              pip install -r ../test-requirements.txt
+            displayName: Install test dependencies
+            workingDirectory: $(Build.SourcesDirectory)/mlops_dbx
+
+          - script: |
+              pytest --junitxml="$(Agent.TempDirectory)/pytest-results.xml"
+            displayName: Run pytest
+            workingDirectory: $(Build.SourcesDirectory)/mlops_dbx
+
+          - task: PublishTestResults@2
+            displayName: Publish pytest results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: $(Agent.TempDirectory)/pytest-results.xml
+              failTaskOnFailedTests: true
+
+      - job: integration_test
+        displayName: Test target integration workflow
+        dependsOn: unit_tests
+        steps:
+          - checkout: self
+            clean: true
+
+          - script: |
+              set -euo pipefail
+              cli_version="${DATABRICKS_CLI_VERSION#v}"
+              install_dir="${AGENT_TEMPDIRECTORY}/databricks-cli"
+              mkdir -p "$install_dir"
+              curl -fsSL -o "$install_dir/databricks.zip" "https://github.com/databricks/cli/releases/download/v${cli_version}/databricks_cli_${cli_version}_linux_amd64.zip"
+              unzip -q -o "$install_dir/databricks.zip" -d "$install_dir"
+              chmod +x "$install_dir/databricks"
+              echo "##vso[task.prependpath]$install_dir"
+              "$install_dir/databricks" -v
+            displayName: Install Databricks CLI
+
+          - script: |
+              databricks bundle validate -t test
+            displayName: Validate bundle for test
+            workingDirectory: $(Build.SourcesDirectory)/mlops_dbx
+            env:
+              DATABRICKS_AUTH_TYPE: oauth-m2m
+              DATABRICKS_HOST: $(DATABRICKS_HOST)
+              DATABRICKS_CLIENT_ID: $(DATABRICKS_CLIENT_ID)
+              DATABRICKS_CLIENT_SECRET: $(STAGING_WORKSPACE_TOKEN)
+
+          - script: |
+              databricks bundle deploy -t test
+            displayName: Deploy bundle to test
+            workingDirectory: $(Build.SourcesDirectory)/mlops_dbx
+            env:
+              DATABRICKS_AUTH_TYPE: oauth-m2m
+              DATABRICKS_HOST: $(DATABRICKS_HOST)
+              DATABRICKS_CLIENT_ID: $(DATABRICKS_CLIENT_ID)
+              DATABRICKS_CLIENT_SECRET: $(STAGING_WORKSPACE_TOKEN)
+
+          - script: |
+              databricks bundle run write_feature_table_job -t test
+            displayName: Run feature engineering workflow
+            workingDirectory: $(Build.SourcesDirectory)/mlops_dbx
+            env:
+              DATABRICKS_AUTH_TYPE: oauth-m2m
+              DATABRICKS_HOST: $(DATABRICKS_HOST)
+              DATABRICKS_CLIENT_ID: $(DATABRICKS_CLIENT_ID)
+              DATABRICKS_CLIENT_SECRET: $(STAGING_WORKSPACE_TOKEN)
+
+          - script: |
+              databricks bundle run model_training_job -t test
+            displayName: Run training workflow
+            workingDirectory: $(Build.SourcesDirectory)/mlops_dbx
+            env:
+              DATABRICKS_AUTH_TYPE: oauth-m2m
+              DATABRICKS_HOST: $(DATABRICKS_HOST)
+              DATABRICKS_CLIENT_ID: $(DATABRICKS_CLIENT_ID)
+              DATABRICKS_CLIENT_SECRET: $(STAGING_WORKSPACE_TOKEN)
+
+      - job: validate_staging_bundle
+        displayName: Validate staging bundle
+        steps:
+          - checkout: self
+            clean: true
+
+          - script: |
+              set -euo pipefail
+              cli_version="${DATABRICKS_CLI_VERSION#v}"
+              install_dir="${AGENT_TEMPDIRECTORY}/databricks-cli"
+              mkdir -p "$install_dir"
+              curl -fsSL -o "$install_dir/databricks.zip" "https://github.com/databricks/cli/releases/download/v${cli_version}/databricks_cli_${cli_version}_linux_amd64.zip"
+              unzip -q -o "$install_dir/databricks.zip" -d "$install_dir"
+              chmod +x "$install_dir/databricks"
+              echo "##vso[task.prependpath]$install_dir"
+              "$install_dir/databricks" -v
+            displayName: Install Databricks CLI
+
+          - script: |
+              set -euo pipefail
+              mkdir -p "$(Build.ArtifactStagingDirectory)/bundle-validation"
+              output="$(Build.ArtifactStagingDirectory)/bundle-validation/staging.txt"
+              summary="$(Build.ArtifactStagingDirectory)/bundle-validation/staging.md"
+
+              set +e
+              databricks bundle validate -t staging 2>&1 | tee "$output"
+              status=${PIPESTATUS[0]}
+              set -e
+
+              {
+                echo "## Bundle Staging Config Validated"
+                echo
+                echo '```'
+                cat "$output"
+                echo '```'
+              } > "$summary"
+              echo "##vso[task.uploadsummary]$summary"
+              exit "$status"
+            displayName: Validate bundle for staging
+            workingDirectory: $(Build.SourcesDirectory)/mlops_dbx
+            env:
+              DATABRICKS_AUTH_TYPE: oauth-m2m
+              DATABRICKS_HOST: $(DATABRICKS_HOST)
+              DATABRICKS_CLIENT_ID: $(DATABRICKS_CLIENT_ID)
+              DATABRICKS_CLIENT_SECRET: $(STAGING_WORKSPACE_TOKEN)
+
+      - job: validate_prod_bundle
+        displayName: Validate prod bundle
+        steps:
+          - checkout: self
+            clean: true
+
+          - script: |
+              set -euo pipefail
+              cli_version="${DATABRICKS_CLI_VERSION#v}"
+              install_dir="${AGENT_TEMPDIRECTORY}/databricks-cli"
+              mkdir -p "$install_dir"
+              curl -fsSL -o "$install_dir/databricks.zip" "https://github.com/databricks/cli/releases/download/v${cli_version}/databricks_cli_${cli_version}_linux_amd64.zip"
+              unzip -q -o "$install_dir/databricks.zip" -d "$install_dir"
+              chmod +x "$install_dir/databricks"
+              echo "##vso[task.prependpath]$install_dir"
+              "$install_dir/databricks" -v
+            displayName: Install Databricks CLI
+
+          - script: |
+              set -euo pipefail
+              mkdir -p "$(Build.ArtifactStagingDirectory)/bundle-validation"
+              output="$(Build.ArtifactStagingDirectory)/bundle-validation/prod.txt"
+              summary="$(Build.ArtifactStagingDirectory)/bundle-validation/prod.md"
+
+              set +e
+              databricks bundle validate -t prod 2>&1 | tee "$output"
+              status=${PIPESTATUS[0]}
+              set -e
+
+              {
+                echo "## Bundle Prod Config Validated"
+                echo
+                echo '```'
+                cat "$output"
+                echo '```'
+              } > "$summary"
+              echo "##vso[task.uploadsummary]$summary"
+              exit "$status"
+            displayName: Validate bundle for prod
+            workingDirectory: $(Build.SourcesDirectory)/mlops_dbx
+            env:
+              DATABRICKS_AUTH_TYPE: oauth-m2m
+              DATABRICKS_HOST: $(DATABRICKS_HOST)
+              DATABRICKS_CLIENT_ID: $(DATABRICKS_CLIENT_ID)
+              # Matches .github/workflows/mlops_dbx-bundle-ci.yml.
+              DATABRICKS_CLIENT_SECRET: $(STAGING_WORKSPACE_TOKEN)

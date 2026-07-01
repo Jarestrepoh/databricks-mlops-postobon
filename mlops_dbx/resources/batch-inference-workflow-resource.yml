@@ -1,0 +1,65 @@
+# new_cluster: &new_cluster
+#   new_cluster:
+#     num_workers: 3
+#     spark_version: 15.3.x-cpu-ml-scala2.12
+#     node_type_id: i3.xlarge
+#     data_security_mode: "SINGLE_USER"
+#     custom_tags:
+#       clusterSource: mlops-stacks_0.4
+
+common_permissions: &permissions
+  permissions:
+    - level: CAN_VIEW
+      group_name: users
+
+resources:
+  jobs:
+    batch_inference_job:
+      name: ${var.username}-${bundle.target}-mlops_dbx-batch-inference-job
+      tasks:
+        - task_key: GenerateFeatures
+          # job_cluster_key: write_feature_table_job_cluster
+          notebook_task:
+            notebook_path: ../feature_engineering/notebooks/GenerateAndWriteFeatures.ipynb
+            base_parameters:
+              # TODO modify these arguments to reflect your setup.
+              catalog_name: ${var.catalog_name}
+              username: ${var.username}
+              input_table_path: telco_churn_inference_raw
+              output_table_name: telco_cust_features
+              primary_keys: customer_id
+              label_table_name: telco_cust_labels
+              # git source information of current ML resource deployment. It will be persisted as part of the workflow run
+              git_source_info: url:${bundle.git.origin_url}; branch:${bundle.git.branch}; commit:${bundle.git.commit}
+        - task_key: batch_inference_job
+          depends_on:
+            - task_key: GenerateFeatures
+          # <<: *new_cluster
+          notebook_task:
+            notebook_path: ../deployment/batch_inference/notebooks/BatchInference.ipynb
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+              username: ${var.username}
+              env: ${bundle.target}
+              input_table_name: telco_churn_inference_raw
+              output_table_name: telco_churn_predictions
+              inference_table_name: telco_churn_inference_table
+              label_table_name: telco_cust_labels
+              model_name: ${var.model_name}
+              # git source information of current ML resource deployment. It will be persisted as part of the workflow run
+              git_source_info: url:${bundle.git.origin_url}; branch:${bundle.git.branch}; commit:${bundle.git.commit}
+
+
+
+
+      schedule:
+        quartz_cron_expression: "0 0 11 * * ?" # daily at 11am
+        timezone_id: UTC
+      <<: *permissions
+      # If you want to turn on notifications for this job, please uncomment the below code,
+      # and provide a list of emails to the on_failure argument.
+      #
+      #  email_notifications:
+      #    on_failure:
+      #      - first@company.com
+      #      - second@company.com

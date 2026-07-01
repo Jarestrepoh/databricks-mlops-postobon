@@ -1,0 +1,63 @@
+name: mlops_dbx-cd-staging-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
+pr: none
+
+variables:
+  - group: databricks-cicd
+  - name: DATABRICKS_CLI_VERSION
+    value: '1.2.1'
+
+pool:
+  vmImage: ubuntu-22.04
+
+stages:
+  - stage: deploy_staging
+    displayName: Deploy staging
+    condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.Reason'], 'Manual'))
+    jobs:
+      - deployment: deploy_staging
+        displayName: Validate and deploy staging
+        environment: mlops-staging
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+
+                - script: |
+                    set -euo pipefail
+                    cli_version="${DATABRICKS_CLI_VERSION#v}"
+                    install_dir="${AGENT_TEMPDIRECTORY}/databricks-cli"
+                    mkdir -p "$install_dir"
+                    curl -fsSL -o "$install_dir/databricks.zip" "https://github.com/databricks/cli/releases/download/v${cli_version}/databricks_cli_${cli_version}_linux_amd64.zip"
+                    unzip -q -o "$install_dir/databricks.zip" -d "$install_dir"
+                    chmod +x "$install_dir/databricks"
+                    echo "##vso[task.prependpath]$install_dir"
+                    "$install_dir/databricks" -v
+                  displayName: Install Databricks CLI
+
+                - script: |
+                    databricks bundle validate -t staging
+                  displayName: Validate bundle for staging
+                  workingDirectory: $(Build.SourcesDirectory)/mlops_dbx
+                  env:
+                    DATABRICKS_AUTH_TYPE: oauth-m2m
+                    DATABRICKS_HOST: $(DATABRICKS_HOST)
+                    DATABRICKS_CLIENT_ID: $(DATABRICKS_CLIENT_ID)
+                    DATABRICKS_CLIENT_SECRET: $(STAGING_WORKSPACE_TOKEN)
+
+                - script: |
+                    databricks bundle deploy -t staging
+                  displayName: Deploy bundle to staging
+                  workingDirectory: $(Build.SourcesDirectory)/mlops_dbx
+                  env:
+                    DATABRICKS_AUTH_TYPE: oauth-m2m
+                    DATABRICKS_HOST: $(DATABRICKS_HOST)
+                    DATABRICKS_CLIENT_ID: $(DATABRICKS_CLIENT_ID)
+                    DATABRICKS_CLIENT_SECRET: $(STAGING_WORKSPACE_TOKEN)

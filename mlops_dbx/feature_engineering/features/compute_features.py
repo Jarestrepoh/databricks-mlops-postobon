@@ -1,13 +1,14 @@
-# src/features/compute_features.py
-
+#  src/features/compute_features.py
+ 
 from __future__ import annotations
-
+ 
 from typing import Iterable, List
-
+ 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
-
-
+from pyspark.sql import Window
+ 
+ 
 # --- Contract: we keep the label OUT of the feature table to avoid leakage.
 REQUIRED_COLUMNS: List[str] = [
     "customerID",
@@ -31,26 +32,29 @@ REQUIRED_COLUMNS: List[str] = [
     "MonthlyCharges",
     "TotalCharges",
 ]
-
-
+ 
+# Creación de nuevas columnas normalizadas para agrupar con promedios
+VALID_GROUPING_COLS = {"contract_type", "internet_service", "monthly_charge_bucket", "tenure_bucket"}
+ 
+ 
 def _require_columns(df: DataFrame, required: Iterable[str]) -> None:
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
-
-
+ 
+ 
 def _lower_trim(col_name: str) -> F.Column:
     return F.lower(F.trim(F.col(col_name).cast("string")))
-
-
+ 
+ 
 def _yn_to_int(col_name: str) -> F.Column:
     """
     Maps "Yes" -> 1, everything else -> 0
     (Works well for: No, No internet service, No phone service, nulls)
     """
     return F.when(_lower_trim(col_name) == F.lit("yes"), F.lit(1)).otherwise(F.lit(0)).cast("int")
-
-
+ 
+ 
 def _to_double_robust(col_name: str) -> F.Column:
     """
     Robust conversion to double:
@@ -61,14 +65,20 @@ def _to_double_robust(col_name: str) -> F.Column:
     raw = F.trim(F.col(col_name).cast("string"))
     as_double = F.when(raw == "", F.lit(None)).otherwise(raw).cast("double")
     return F.when(F.isnan(as_double), F.lit(None)).otherwise(as_double)
-
-
-def compute_features_fn(df_raw: DataFrame) -> DataFrame:
+ 
+ 
+# parámetro `grouping_col` añadido a la firma de la función
+# >>> ÚNICA definición de compute_features_fn (antes había dos, la segunda
+# pisaba a la primera y por eso `grouping_col` no llegaba a existir en runtime).
+def compute_features_fn(df_raw: DataFrame, grouping_col: str = "contract_type") -> DataFrame:
     """
     Feature engineering for Telco Customer Churn dataset.
-
+ 
     Input:
       - df_raw: Spark DataFrame with original Kaggle schema (including customerID).
+      - grouping_col: column used to compute group-level average features
+        (promedio_venta, promedio_cargues). Must be one of:
+        "contract_type", "internet_service", "monthly_charge_bucket", "tenure_bucket".
     Output:
       - Spark DataFrame suitable for Unity Catalog Feature Store table:
         * primary key: customer_id
@@ -76,7 +86,10 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
         * scalar columns only (int/double/string)
     """
     _require_columns(df_raw, REQUIRED_COLUMNS)
-
+ 
+    if grouping_col not in VALID_GROUPING_COLS:
+        raise ValueError(f"grouping_col must be one of {VALID_GROUPING_COLS}, got '{grouping_col}'")
+ 
     # --------------------------
     # 0) Base normalization
     # --------------------------
@@ -110,10 +123,10 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
         .withColumn("tenure_months", F.coalesce(F.col("tenure_months"), F.lit(0)))
         .withColumn("monthly_charges", F.coalesce(F.col("monthly_charges"), F.lit(0.0)))
     )
-
+ 
     # Helpful missingness signal (in the full dataset TotalCharges can be blank)
     df = df.withColumn("is_total_charges_missing", F.when(F.col("total_charges").isNull(), 1).otherwise(0).cast("int"))
-
+ 
     # --------------------------
     # 1) Binary / household features
     # --------------------------
@@ -123,18 +136,18 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
         .withColumn("has_dependents", _yn_to_int("dependents"))
         .withColumn("paperless_billing_flag", _yn_to_int("paperless_billing"))
     )
-
+ 
     # --------------------------
     # 2) Service features (phone / internet)
     # --------------------------
     df = df.withColumn("phone_service_flag", _yn_to_int("phone_service"))
-
+ 
     # MultipleLines can be "No phone service". Force it to 0 when no phone service.
     df = df.withColumn(
         "multiple_lines_flag",
         F.when(F.col("phone_service_flag") == 0, F.lit(0)).otherwise(_yn_to_int("multiple_lines")).cast("int"),
     )
-
+ 
     # Internet provider flags
     internet_l = _lower_trim("internet_service")
     df = (
@@ -143,7 +156,7 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
         .withColumn("internet_is_dsl", F.when(internet_l == "dsl", 1).otherwise(0).cast("int"))
         .withColumn("internet_is_fiber", F.when(internet_l == "fiber optic", 1).otherwise(0).cast("int"))
     )
-
+ 
     # Add-on services (common churn drivers)
     df = (
         df
@@ -154,7 +167,7 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
         .withColumn("streaming_tv_flag", _yn_to_int("streaming_tv"))
         .withColumn("streaming_movies_flag", _yn_to_int("streaming_movies"))
     )
-
+ 
     df = (
         df
         .withColumn(
@@ -171,7 +184,7 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
         .withColumn("security_support_cnt", (F.col("online_security_flag") + F.col("tech_support_flag")).cast("int"))
         .withColumn("streaming_cnt", (F.col("streaming_tv_flag") + F.col("streaming_movies_flag")).cast("int"))
     )
-
+ 
     # --------------------------
     # 3) Contract / payments
     # --------------------------
@@ -190,7 +203,7 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
         .withColumn("is_auto_payment", F.when(F.col("payment_method").contains("(automatic)"), 1).otherwise(0).cast("int"))
         .withColumn("is_electronic_check", F.when(F.col("payment_method") == "Electronic check", 1).otherwise(0).cast("int"))
     )
-
+ 
     # --------------------------
     # 4) Tenure / billing behavior
     # --------------------------
@@ -207,7 +220,7 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
         )
         .withColumn("is_new_customer", F.when(F.col("tenure_months") < 6, 1).otherwise(0).cast("int"))
     )
-
+ 
     # Total charges: if missing, impute with monthly_charges * tenure
     df = df.withColumn(
         "total_charges_filled",
@@ -216,7 +229,7 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
             (F.col("monthly_charges") * F.col("tenure_months")).cast("double"),
         ),
     )
-
+ 
     # Averages and “consistency” signals
     df = (
         df
@@ -239,13 +252,38 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
              .otherwise("high"),
         )
     )
-
+ 
+    # Cálculo de variables nuevas - Group-level averages (promedio_venta / promedio_cargues)
+    # Se ubica AQUI (después de la Sección 4) porque promedio_cargues depende de
+    # `total_charges_filled`, que recién se calculó arriba. Ambas columnas se
+    # calculan como promedio DENTRO de cada grupo definido por `grouping_col`
+    # (por ejemplo: contract_type), usando una función de ventana (Window),
+    # no un promedio global.
+    # --------------------------
+    # 4.1) Group-level averages (promedio_venta / promedio_cargues)
+    # --------------------------
+    group_window = Window.partitionBy(F.col(grouping_col))
+ 
+    df = (
+        df
+        .withColumn(
+            # promedio_venta = promedio de MonthlyCharges (monthly_charges) por grupo
+            "promedio_venta",
+            F.avg(F.col("monthly_charges")).over(group_window).cast("double"),
+        )
+        .withColumn(
+            # promedio_cargues = promedio de TotalCharges (total_charges_filled) por grupo
+            "promedio_cargues",
+            F.avg(F.col("total_charges_filled")).over(group_window).cast("double"),
+        )
+    )
+ 
     # --------------------------
     # 5) Final selection (Feature Store friendly)
     # --------------------------
     feature_cols = [
         "customer_id",
-
+ 
         # low-card categoricals (use OHE later)
         "gender",
         "internet_service",
@@ -253,24 +291,24 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
         "payment_method",
         "tenure_bucket",
         "monthly_charge_bucket",
-
+ 
         # demographics / household
         "senior_citizen",
         "has_partner",
         "has_dependents",
-
+ 
         # tenure
         "tenure_months",
         "tenure_years",
         "is_new_customer",
-
+ 
         # services
         "phone_service_flag",
         "multiple_lines_flag",
         "has_internet",
         "internet_is_dsl",
         "internet_is_fiber",
-
+ 
         # add-ons
         "online_security_flag",
         "online_backup_flag",
@@ -281,7 +319,7 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
         "addon_services_cnt",
         "security_support_cnt",
         "streaming_cnt",
-
+ 
         # contract/payment signals
         "contract_months",
         "is_month_to_month",
@@ -289,13 +327,17 @@ def compute_features_fn(df_raw: DataFrame) -> DataFrame:
         "paperless_billing_flag",
         "is_auto_payment",
         "is_electronic_check",
-
+ 
         # charges
         "monthly_charges",
         "total_charges_filled",
         "avg_monthly_charge_lifetime",
         "is_total_charges_missing",
         "abs_charges_gap",
+ 
+        # columnas agregadas al feature table final
+        "promedio_venta",
+        "promedio_cargues",
     ]
-
+ 
     return df.select(*feature_cols)

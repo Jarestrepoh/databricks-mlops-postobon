@@ -16,7 +16,7 @@ variables:
     description: The catalog name to save the trained model
   username:
     description: User name
-    default: ezapata
+    default: jacevedor
     
 include:
   # Resources folder contains ML artifact resources for the ML project that defines model and experiment
@@ -27,7 +27,7 @@ include:
   - ./resources/model-workflow-resource.yml
   - ./resources/feature-engineering-workflow-resource.yml
   # TODO: uncomment once monitoring inference table has been created
-  # - ./resources/monitoring-resource.yml
+  - ./resources/monitoring-resource.yml
 
 # Deployment Target specific values for workspace
 targets:
